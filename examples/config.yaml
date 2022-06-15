@@ -1,0 +1,21 @@
+authentication:
+  identityStore:
+    dbname: "identity_store"
+    host: "postgres.default.svc.cluster.local"
+    password: "docker"
+    port: "5432"
+    user: "postgres"
+
+authorization:
+  hmacSecret: qhA9Rf8QK2K8v9alvzkb
+
+gateway:
+  port: 8080
+
+matchPaths:
+  - value: "/profiles"
+    targetHost: "profileservice"
+    targetPort: 3001
+  - value: "/galleries"
+    targetHost: "galleryservice"
+    targetPort: 3002
