@@ -2,27 +2,25 @@ package apigateway
 
 import (
 	"github.com/spf13/viper"
-	"log"
 )
 
 type Config struct {
-	Authentication Authentication
-	Authorization  Authorization
-	Gateway        Gateway
-	MatchPaths     []MatchPaths
+	Auth       Auth
+	Gateway    Gateway
+	MatchPaths []MatchPaths
 }
 
-type Authentication struct {
-	IdentityStore identityStore
+type Auth struct {
+	Internal       AuthInternal
+	BasePath       string
+	SigninPath     string
+	SignoutPath    string
+	SignupPath     string
+	ValidationPath string
 }
 
-type identityStore struct {
-	DBName, Host, Password, User string
-	Port                         uint16
-}
-
-type Authorization struct {
-	HmacSecret string
+type AuthInternal struct {
+	IDHeader string
 }
 
 type Gateway struct {
@@ -39,7 +37,6 @@ func PrepareConfigFile(name string, searchPaths []string) {
 	viper.SetConfigName(name)
 	viper.SetConfigType("yaml")
 	for _, path := range searchPaths {
-		log.Println(path)
 		viper.AddConfigPath(path)
 	}
 }
@@ -55,6 +52,8 @@ func NewConfig() (Config, error) {
 	if err != nil {
 		return conf, err
 	}
+
+	// TODO: Do validations for URL paths and similar...
 
 	return conf, nil
 }

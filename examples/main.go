@@ -1,21 +1,18 @@
 package main
 
 import (
-	"github.com/baturalpk/apigateway"
 	"log"
+
+	"github.com/baturalpk/apigateway"
 )
 
 func main() {
-	apigateway.PrepareConfigFile("config", []string{"./examples"})
+	apigateway.PrepareConfigFile("config", []string{"./examples", "."})
 	config, err := apigateway.NewConfig()
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	authProvider, err := apigateway.NewAuthProvider(config)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	apigateway.NewReverseProxy(config, authProvider).ListenAndServe()
+	// TODO: Add graceful shutdown
+	apigateway.NewReverseProxy(config).ListenAndServe()
 }

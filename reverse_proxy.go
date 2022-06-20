@@ -2,7 +2,7 @@ package apigateway
 
 import (
 	"crypto/tls"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,15 +14,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func NewReverseProxy(conf Config, ap *authProvider) *reverseProxy {
-	return &reverseProxy{
-		authp:  ap,
-		config: conf,
-	}
+func NewReverseProxy(conf Config) *reverseProxy {
+	return &reverseProxy{config: conf}
 }
 
 type reverseProxy struct {
-	authp  *authProvider
 	config Config
 }
 
@@ -40,40 +36,40 @@ func (prx *reverseProxy) ListenAndServe() {
 }
 
 func (prx *reverseProxy) authHandler(c *gin.Context) {
-	intent := c.Param("intent")
+	var (
+		u   *url.URL
+		err error
+	)
+	intent := strings.ToLower(c.Param("intent"))
+
 	switch intent {
 	case "signup":
-		var body NewIdentityRequest
-		if err := c.Bind(&body); err != nil {
-			return
-		}
-		if resp, err := prx.authp.NewIdentity(body); err != nil {
-			if resp.existingEmailError {
-				c.AbortWithStatus(http.StatusInternalServerError)
-				return
-			}
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
+		u, err = prx.parseURL(
+			prx.config.Auth.BasePath,
+			prx.config.Auth.SignupPath,
+		)
+
 	case "signin":
-		var body AuthenticateRequest
-		if err := c.Bind(&body); err != nil {
-			return
-		}
-		resp, err := prx.authp.Authenticate(body)
-		if err != nil {
-			if resp.identityVerificationFailed {
-				c.AbortWithStatus(http.StatusUnauthorized)
-				return
-			}
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-		c.JSON(http.StatusOK, resp.tokenString)
+		u, err = prx.parseURL(
+			prx.config.Auth.BasePath,
+			prx.config.Auth.SigninPath,
+		)
+
+	case "signout":
+		u, err = prx.parseURL(
+			prx.config.Auth.BasePath,
+			prx.config.Auth.SignoutPath,
+		)
+
 	default:
 		c.AbortWithStatus(http.StatusNotFound)
+		return
 	}
-	return
+
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}
+	prx.newProxy(u).ServeHTTP(c.Writer, c.Request)
 }
 
 func (prx *reverseProxy) genericHandler(c *gin.Context) {
@@ -87,66 +83,108 @@ func (prx *reverseProxy) genericHandler(c *gin.Context) {
 
 	for _, matchPath := range prx.config.MatchPaths {
 		if strings.HasPrefix(path, matchPath.Value) {
-			tokenString, err := extractBearer(strings.Trim(c.GetHeader("Authorization"), " "))
-			if err != nil {
-				c.AbortWithStatus(http.StatusUnauthorized)
-				return
-			}
-
-			resp, err := prx.authp.ValidateAuthorization(tokenString)
-			if err != nil {
-				c.AbortWithStatus(http.StatusUnauthorized)
-				return
-			}
-
-			u, err := prx.ParseURL(fmt.Sprintf("%s:%d", matchPath.TargetHost, matchPath.TargetPort))
+			// Validate authorization
+			au, err := prx.parseURL(
+				prx.config.Auth.BasePath,
+				prx.config.Auth.ValidationPath,
+			)
 			if err != nil {
 				c.AbortWithStatus(http.StatusInternalServerError)
 				return
 			}
 
-			prx.NewProxy(u, resp.id).ServeHTTP(c.Writer, c.Request)
+			req, err := http.NewRequest("POST", au.String(), c.Copy().Request.Body)
+			req.Header.Add("Content-Type", "application/json")
+			req.Header.Add("Authorization", c.GetHeader("Authorization"))
+			cookies := c.Copy().Request.Cookies()
+			for _, cookie := range cookies {
+				req.AddCookie(cookie)
+			}
+			if err != nil {
+				log.Println(err)
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Println(err)
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+			defer resp.Body.Close()
+
+			if code := resp.StatusCode; code != 200 {
+				c.DataFromReader(code, resp.ContentLength, resp.Header.Get("Content-Type"), resp.Body, map[string]string{})
+				return
+			}
+
+			// TODO: Get expected authorization response fields from config. file
+			var abody struct {
+				Id string
+				// Email string
+			}
+			// TODO: Support response bodies other than JSON
+			if err = json.NewDecoder(resp.Body).Decode(&abody); err != nil {
+				log.Println(err)
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+
+			// Forward to internal service
+			u, err := prx.parseURL(fmt.Sprintf("%s:%d%s", matchPath.TargetHost, matchPath.TargetPort, path))
+			if err != nil {
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+
+			prx.newServiceProxy(u, abody.Id).ServeHTTP(c.Writer, c.Request)
 			return
 		}
 	}
-
 	c.AbortWithStatus(http.StatusNotFound)
-	return
 }
 
-func (prx *reverseProxy) ParseURL(addr string) (*url.URL, error) {
-	u, err := url.Parse(fmt.Sprintf("https://%s", addr))
+// TODO: Configure and test HTTPS situations
+func (prx *reverseProxy) parseURL(addr ...string) (*url.URL, error) {
+	u, err := url.Parse(fmt.Sprintf("http://%s", strings.Join(addr, "")))
 	if err != nil {
+		log.Println(err)
 		return nil, err
 	}
 	return u, nil
 }
 
-func (*reverseProxy) NewProxy(url *url.URL, userID string) *httputil.ReverseProxy {
-	prx := httputil.NewSingleHostReverseProxy(url)
-	prx.Director = func(req *http.Request) {
+func (*reverseProxy) newProxy(url *url.URL) *httputil.ReverseProxy {
+	rp := httputil.NewSingleHostReverseProxy(url)
+	rp.Director = func(req *http.Request) {
+		req.Host = url.Host
+		req.URL.Scheme = url.Scheme
+		req.URL.Host = url.Host
+		req.URL.Path = url.Path
+	}
+	rp.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	return rp
+}
+
+func (prx *reverseProxy) newServiceProxy(url *url.URL, id string) *httputil.ReverseProxy {
+	rp := httputil.NewSingleHostReverseProxy(url)
+	rp.Director = func(req *http.Request) {
 		req.Host = url.Host
 		req.URL.Scheme = url.Scheme
 		req.URL.Host = url.Host
 		req.URL.Path = url.Path
 
-		// Registered microservices can safely recognize the user by accessing header["x-user-id"]
-		req.Header.Set("x-user-id", userID)
+		req.Header.Set(prx.config.Auth.Internal.IDHeader, id)
 	}
-	prx.Transport = &http.Transport{
+	rp.ModifyResponse = func(req *http.Response) error {
+		req.Header.Del(prx.config.Auth.Internal.IDHeader)
+		return nil
+	}
+	rp.Transport = &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	return prx
-}
-
-const (
-	BearerPrefix = "Bearer "
-	BearerN      = len(BearerPrefix)
-)
-
-func extractBearer(header string) (string, error) {
-	if len(header) < BearerN || header[:BearerN] != BearerPrefix {
-		return "", errors.New("invalid bearer header")
-	}
-	return header[BearerN:], nil
+	return rp
 }

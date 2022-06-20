@@ -1,13 +1,11 @@
-authentication:
-  identityStore:
-    dbname: "identity_store"
-    host: "postgres.default.svc.cluster.local"
-    password: "docker"
-    port: "5432"
-    user: "postgres"
-
-authorization:
-  hmacSecret: qhA9Rf8QK2K8v9alvzkb
+auth:
+  basePath: "127.0.0.1:9000"
+  signupPath: /identity
+  signinPath: /session/new
+  validationPath: /session/validate
+  signoutPath: /session/destroy
+  internal:
+    idHeader: "x-user-id" # Should not be a invalid and/or canonical/standard HTTP header
 
 gateway:
   port: 8080
@@ -19,3 +17,6 @@ matchPaths:
   - value: "/galleries"
     targetHost: "galleryservice"
     targetPort: 3002
+  - value: /items
+    targetHost: 127.0.0.1
+    targetPort: 8000
