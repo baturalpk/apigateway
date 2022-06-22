@@ -24,7 +24,10 @@ type AuthInternal struct {
 }
 
 type Gateway struct {
-	Port uint16
+	Schema      string
+	TLSCertFile string
+	TLSKeyFile  string
+	Port        uint16
 }
 
 type MatchPaths struct {
