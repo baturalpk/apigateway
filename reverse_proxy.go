@@ -15,11 +15,26 @@ import (
 )
 
 func NewReverseProxy(conf Config) *reverseProxy {
-	return &reverseProxy{config: conf}
+	var prx reverseProxy
+	prx.config = conf
+
+	if conf.Gateway.Schema == "https" {
+		tlsPair, err := tls.LoadX509KeyPair(
+			conf.Gateway.TLSCertFile,
+			conf.Gateway.TLSKeyFile,
+		)
+		if err != nil {
+			log.Fatalf("err = NewReverseProxy = LoadX509KeyPair = %v", err)
+		}
+
+		prx.tlsCerts = append(prx.tlsCerts, tlsPair)
+	}
+	return &prx
 }
 
 type reverseProxy struct {
-	config Config
+	config   Config
+	tlsCerts []tls.Certificate
 }
 
 func (prx *reverseProxy) ListenAndServe() {
@@ -28,13 +43,28 @@ func (prx *reverseProxy) ListenAndServe() {
 	g.POST("/auth/:intent", prx.authHandler)
 	g.Any("/api/*path", prx.genericHandler)
 
-	err := g.Run(fmt.Sprintf("0.0.0.0:%d", prx.config.Gateway.Port))
-	if err != nil {
+	errChan := make(chan error, 1)
+	go prx.Run(g, errChan)
+
+	if err := <-errChan; err != nil {
 		log.Println(err)
 		os.Exit(1)
 	}
 }
 
+func (prx *reverseProxy) Run(g *gin.Engine, ch chan error) {
+	if prx.config.Gateway.Schema == "https" {
+		ch <- g.RunTLS(
+			fmt.Sprintf("0.0.0.0:%d", prx.config.Gateway.Port),
+			prx.config.Gateway.TLSCertFile,
+			prx.config.Gateway.TLSKeyFile,
+		)
+		return
+	}
+	ch <- g.Run(fmt.Sprintf("0.0.0.0:%d", prx.config.Gateway.Port))
+}
+
+// TODO: Evaluate OAuth2 integration
 func (prx *reverseProxy) authHandler(c *gin.Context) {
 	var (
 		u   *url.URL
@@ -45,18 +75,21 @@ func (prx *reverseProxy) authHandler(c *gin.Context) {
 	switch intent {
 	case "signup":
 		u, err = prx.parseURL(
+			prx.config.Gateway.Schema,
 			prx.config.Auth.BasePath,
 			prx.config.Auth.SignupPath,
 		)
 
 	case "signin":
 		u, err = prx.parseURL(
+			prx.config.Gateway.Schema,
 			prx.config.Auth.BasePath,
 			prx.config.Auth.SigninPath,
 		)
 
 	case "signout":
 		u, err = prx.parseURL(
+			prx.config.Gateway.Schema,
 			prx.config.Auth.BasePath,
 			prx.config.Auth.SignoutPath,
 		)
@@ -82,9 +115,11 @@ func (prx *reverseProxy) genericHandler(c *gin.Context) {
 	}
 
 	for _, matchPath := range prx.config.MatchPaths {
+		// TODO: Test alternative path matching methods other than .HasPrefix()
 		if strings.HasPrefix(path, matchPath.Value) {
 			// Validate authorization
 			au, err := prx.parseURL(
+				prx.config.Gateway.Schema,
 				prx.config.Auth.BasePath,
 				prx.config.Auth.ValidationPath,
 			)
@@ -94,16 +129,35 @@ func (prx *reverseProxy) genericHandler(c *gin.Context) {
 			}
 
 			req, err := http.NewRequest("POST", au.String(), c.Copy().Request.Body)
-			req.Header.Add("Content-Type", "application/json")
-			req.Header.Add("Authorization", c.GetHeader("Authorization"))
-			cookies := c.Copy().Request.Cookies()
-			for _, cookie := range cookies {
-				req.AddCookie(cookie)
-			}
 			if err != nil {
 				log.Println(err)
 				c.AbortWithStatus(http.StatusInternalServerError)
 				return
+			}
+			req.Header.Add("Content-Type", "application/json")
+
+			// Pass Authorization header
+			req.Header.Add("Authorization", c.GetHeader("Authorization"))
+
+			// Pass cookies
+			cookies := c.Copy().Request.Cookies()
+			for _, cookie := range cookies {
+				req.AddCookie(cookie)
+			}
+
+			// Determine whether the request is for websocket upgrade,
+			// [https://datatracker.ietf.org/doc/html/rfc6455] [Page 19] [2.]
+			if c.GetHeader("Upgrade") == "websocket" {
+				// Additionally, pass query string if it's a websocket connection
+				// Assumes that required authorization secrets are sent via query (e.g., wss://.../?token=...)
+				// TODO: Review unusual auth. handling methods such as passing secrets using "Sec-WebSocket-Protocol" header
+				q := req.URL.Query()
+				for k, v := range c.Request.URL.Query() {
+					for _, subv := range v {
+						q.Add(k, subv)
+					}
+				}
+				req.URL.RawQuery = q.Encode()
 			}
 
 			resp, err := http.DefaultClient.Do(req)
@@ -132,7 +186,7 @@ func (prx *reverseProxy) genericHandler(c *gin.Context) {
 			}
 
 			// Forward to internal service
-			u, err := prx.parseURL(fmt.Sprintf("%s:%d%s", matchPath.TargetHost, matchPath.TargetPort, path))
+			u, err := prx.parseURL(prx.config.Gateway.Schema, fmt.Sprintf("%s:%d%s", matchPath.TargetHost, matchPath.TargetPort, path))
 			if err != nil {
 				c.AbortWithStatus(http.StatusInternalServerError)
 				return
@@ -145,9 +199,8 @@ func (prx *reverseProxy) genericHandler(c *gin.Context) {
 	c.AbortWithStatus(http.StatusNotFound)
 }
 
-// TODO: Configure and test HTTPS situations
-func (prx *reverseProxy) parseURL(addr ...string) (*url.URL, error) {
-	u, err := url.Parse(fmt.Sprintf("http://%s", strings.Join(addr, "")))
+func (prx *reverseProxy) parseURL(schema string, addr ...string) (*url.URL, error) {
+	u, err := url.Parse(fmt.Sprintf("%s://%s", schema, strings.Join(addr, "")))
 	if err != nil {
 		log.Println(err)
 		return nil, err
@@ -155,7 +208,20 @@ func (prx *reverseProxy) parseURL(addr ...string) (*url.URL, error) {
 	return u, nil
 }
 
-func (*reverseProxy) newProxy(url *url.URL) *httputil.ReverseProxy {
+func (prx *reverseProxy) newProxyTransport() *http.Transport {
+	if prx.config.Gateway.Schema == "https" {
+		return &http.Transport{
+			TLSClientConfig: &tls.Config{
+				Certificates: prx.tlsCerts,
+			},
+		}
+	}
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+}
+
+func (prx *reverseProxy) newProxy(url *url.URL) *httputil.ReverseProxy {
 	rp := httputil.NewSingleHostReverseProxy(url)
 	rp.Director = func(req *http.Request) {
 		req.Host = url.Host
@@ -163,9 +229,7 @@ func (*reverseProxy) newProxy(url *url.URL) *httputil.ReverseProxy {
 		req.URL.Host = url.Host
 		req.URL.Path = url.Path
 	}
-	rp.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	rp.Transport = prx.newProxyTransport()
 	return rp
 }
 
@@ -183,8 +247,6 @@ func (prx *reverseProxy) newServiceProxy(url *url.URL, id string) *httputil.Reve
 		req.Header.Del(prx.config.Auth.Internal.IDHeader)
 		return nil
 	}
-	rp.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	rp.Transport = prx.newProxyTransport()
 	return rp
 }

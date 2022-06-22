@@ -16,3 +16,9 @@
 
 .idea/
 .vscode/
+
+# Secrets
+**/*.pem
+**/*.cert
+**/*.env
+**/*.env.*
