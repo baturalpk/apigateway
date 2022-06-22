@@ -64,6 +64,7 @@ func (prx *reverseProxy) Run(g *gin.Engine, ch chan error) {
 	ch <- g.Run(fmt.Sprintf("0.0.0.0:%d", prx.config.Gateway.Port))
 }
 
+// TODO: Evaluate OAuth2 integration
 func (prx *reverseProxy) authHandler(c *gin.Context) {
 	var (
 		u   *url.URL
@@ -128,16 +129,35 @@ func (prx *reverseProxy) genericHandler(c *gin.Context) {
 			}
 
 			req, err := http.NewRequest("POST", au.String(), c.Copy().Request.Body)
-			req.Header.Add("Content-Type", "application/json")
-			req.Header.Add("Authorization", c.GetHeader("Authorization"))
-			cookies := c.Copy().Request.Cookies()
-			for _, cookie := range cookies {
-				req.AddCookie(cookie)
-			}
 			if err != nil {
 				log.Println(err)
 				c.AbortWithStatus(http.StatusInternalServerError)
 				return
+			}
+			req.Header.Add("Content-Type", "application/json")
+
+			// Pass Authorization header
+			req.Header.Add("Authorization", c.GetHeader("Authorization"))
+
+			// Pass cookies
+			cookies := c.Copy().Request.Cookies()
+			for _, cookie := range cookies {
+				req.AddCookie(cookie)
+			}
+
+			// Determine whether the request is for websocket upgrade,
+			// [https://datatracker.ietf.org/doc/html/rfc6455] [Page 19] [2.]
+			if c.GetHeader("Upgrade") == "websocket" {
+				// Additionally, pass query string if it's a websocket connection
+				// Assumes that required authorization secrets are sent via query (e.g., wss://.../?token=...)
+				// TODO: Review unusual auth. handling methods such as passing secrets using "Sec-WebSocket-Protocol" header
+				q := req.URL.Query()
+				for k, v := range c.Request.URL.Query() {
+					for _, subv := range v {
+						q.Add(k, subv)
+					}
+				}
+				req.URL.RawQuery = q.Encode()
 			}
 
 			resp, err := http.DefaultClient.Do(req)

@@ -23,3 +23,9 @@ matchPaths:
   - value: /items
     targetHost: 127.0.0.1
     targetPort: 8000
+  - value: /websocket
+    targetHost: 127.0.0.1
+    targetPort: 7000
+  - value: /whoami
+    targetHost: localhost
+    targetPort: 10500
